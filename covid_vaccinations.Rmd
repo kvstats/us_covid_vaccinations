@@ -1,0 +1,453 @@
+---
+title: "COVID-19 Vaccination Rates in the United States"
+author: "Kristine Villaluna"
+date: "21/01/2022"
+output: 
+  pdf_document:
+  latex_engine: xelatex
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+```
+
+```{r}
+library(here)
+library(readr)
+library(readxl)
+library(janitor)
+library(RColorBrewer)
+library(tidyverse)
+library(skimr)
+library(AER)
+library(MASS)
+library(knitr)
+library(gridExtra)
+library(faraway)
+library(arm)
+```
+
+
+# Vaccinations
+
+This analysis relates to COVID-19 vaccination rates in the United States. We are interested in exploring factors that are associated with differences in vaccine coverage by US county.
+
+## Data Description
+The latest data on vaccination coverage (and the data dictionary) can be downloaded here: https://data.cdc.gov/Vaccinations/COVID-19-Vaccinations-in-the-United-States-County/8xkx-amqh/data. 
+
+For this analysis, we will consider data from the 15th of January. Note that we will be interested in people who have had at least two vaccinations, which refers to columns that have the Series_Complete prefix.
+
+We also have a dataset acs that contains a range of different demographic, socioeconomic, and health variables by county. These were obtained from the American Community Survey (ACS) via the R package tidycensus.
+
+## EDA
+
+```{r}
+# read in vaccination  data and clean col names
+vaccinations <- read_csv(here("Data/vaccinations.csv"))
+vaccinations <- clean_names(vaccinations)
+
+# filter to Jan 15 
+vaccinations <- vaccinations %>% filter(date == "01/15/2022")
+
+# get rid of cols we don't need
+vaccinations <- vaccinations %>% 
+  dplyr::select(!starts_with("administered")) %>% 
+  dplyr::select(!starts_with("booster"))
+```
+
+```{r}
+# read in ACS data
+acs <- read_csv(here("Data/acs.csv"))
+acs <- clean_names(acs)
+```
+
+```{r}
+# combine the two data sets
+acs_wide <- acs %>% pivot_wider(names_from=variable, values_from=value)
+vax <- left_join(vaccinations,acs_wide, by="fips")
+
+vax$metro_status <- as.factor(vax$metro_status)
+vax$svi_ctgy <- as.factor(vax$svi_ctgy)
+```
+
+```{r eval=FALSE}
+# EDA
+skim(vax)
+```
+
+After reading in the vaccination and ACS data, the two data sets were merged by `fips` and EDA performed.
+
+First, a quick check was done to see the minimum and maximum counts of fully vaccinated individuals 18+ by each state was done to see the differences in vaccinations between counties in the same state. The table is as follows:
+
+```{r}
+# tables
+
+# min/max by state
+min_max <- vax %>%
+  group_by(recip_state) %>%
+  summarise(
+    Max18Plus = max(series_complete_18plus, na.rm = T),
+    Min18Plus = min(series_complete_18plus, na.rm = T)
+  ) %>%
+  arrange(recip_state)
+
+kable(min_max)
+```
+
+Here we can see some states like Hawaii (HI) with 0 for their counts. Upon further inspection, we find that this is because there is no county level data available for the state of Hawaii. Moreover, we can see that there are some states like Texas (TX) and Virginia (VA) which have counties with 0 counts.
+
+Next, we plotted some potential explanatory variables to see the distributions and potentially motivate our model building. 
+
+### Education - Bachelor's and Above
+```{r}
+bach <- ggplot(vax, aes(x=prop_bachelor_above, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="% of Pop (18+) Vaccinated by Proportion Bachelor's and Above", x="Proportion Bachelors and Above", y="% of Population (18+) Fully Vaccinated")
+bach
+```
+
+Here we can see a positive relationship, indicating that the higher the proportion of the population with a Bachelor's degree or higher, the higher the percent of the population fully vaccinated. This is not surprising as this is something you may intuitively suspect. 
+
+### Not in Labour Force
+```{r}
+nilf <-
+  ggplot(vax, aes(x=prop_nilf, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="% of Pop (18+) Vaccinated by Proportion Not in Labour Force", x="Proportion Not in Labour Force", y="% of Population (18+) Fully Vaccinated")
+nilf
+```
+
+In this plot we see a negative relationship between the proportion of the population not in the labour force and the percentage of the 18+ population that is fully vaccinated. This means that the higher the proportion of the population that is not in the labour force, the lower the percentage of the 18+ population that is fully vaccinated. 
+
+
+### Metro Status
+```{r}
+metro <- ggplot(data = na.omit(vax), aes(x = "", y = series_complete_18plus_pop_pct, fill=metro_status)) + 
+  geom_boxplot() + 
+  labs(title="Percentage of Population (18+) Vaccinated by Metro Status", y="% of Population (18+) Fully Vaccinated ") +
+  theme(axis.title.x = element_blank())
+metro
+```
+
+In this plot we can see that the percentage of the 18+ population that is fully vaccinated is a bit higher in metro areas versus non-metro areas. The mean appears to be approximately 60% in the metro areas, and approximately 55% in non-metro areas. 
+
+### Social Vulnerability Index
+
+```{r}
+svg <- 	
+  ggplot(na.omit(vax)) +
+	aes(x = series_complete_18plus_pop_pct, fill=svi_ctgy) +
+	geom_histogram(bins = 20, color="black") +
+	labs(title = "Histograms of % of Population (18+) Vaccinated by SVI") +
+	facet_wrap(.~svi_ctgy, shrink = TRUE)
+svg
+```
+
+Finally, here we see a plot including four histograms faceted by the CDC's Social Vulnerability Index (SVI). The [CDC](https://www.atsdr.cdc.gov/placeandhealth/svi/index.html) defines this as the potential negative effects on communities caused by external stresses on human health. Such stresses include natural or human-caused disasters, or disease outbreaks. Here we can see that the categories A and B have slightly higher percentage of 18+ people vaccinated as we can see from the peaks. 
+
+For reference, the rank categories are: A = 0– 0.25 SVI rank, B = 0.2501–0.50 SVI rank, C = 0.5001–0.75 SVI rank, and D = 0.7501–1.0 SVI rank.
+
+Additional EDA plots are available in the .Rmd file. 
+
+```{r eval=FALSE}
+##### EXTRA PLOTS ###### 
+
+### Scatterplots ###
+
+# Education 
+hs <- ggplot(vax, aes(y=prop_less_than_hs, x=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Proportion Less Than HS", y="Proportion Less than HS", x="% of Population (18+) Fully Vaccinated")
+hs
+
+# Race
+white <- ggplot(vax, aes(y=prop_white, x=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Proportion White", y="Proportion White", x="% of Population (18+) Fully Vaccinated")
+white
+
+# Health
+health <- ggplot(vax, aes(x=prop_health_insurance, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Proportion with Health Insurance", x="Proportion with Health Insurance", y="% of Population (18+) Fully Vaccinated")
+health
+
+# Age
+age <-
+  ggplot(vax, aes(x=median_age, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Median Age", x="Median Age", y="% of Population (18+) Fully Vaccinated")
+age
+
+# Income - keep
+income <-
+  ggplot(vax, aes(x=median_income, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Median Income", x="Median Income", y="% of Population (18+) Fully Vaccinated")
+income
+
+# Rent - same as income
+rent <-
+  ggplot(vax, aes(x=median_rent, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Median Rent", x="Median Rent", y="% of Population (18+) Fully Vaccinated")
+rent
+
+
+# Employment
+unemp <-
+  ggplot(vax, aes(x=prop_unemployed, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Proportion Unemployed", x="Proportion Unemployed", y="% of Population (18+) Fully Vaccinated")
+unemp
+
+# Low income
+ip_ratio <-
+  ggplot(vax, aes(x=prop_low_ratio_ip, y=series_complete_18plus_pop_pct)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  labs(title="Percentage of Population (18+) Vaccinated by Proportion with Low Income to Poverty", x="Proportion Low IP Ratio", y="% of Population (18+) Fully Vaccinated")
+ip_ratio
+```
+
+\newpage
+
+## Analysis 
+
+Next, we would like to build a regression model at the county level to help investigate patterns in the full vaccination rate for the population aged 18+ (that is, people aged 18+ who have received at least two vaccines). 
+
+For this analysis, I will consider modeling the outcome measure as a proportion of the population aged 18+ who are fully vaccinated by county using a binomial model, where $n$ is equal to the total population count in the county, $y$ is the number of people 18+ who are fully vaccinated, and $p$ is the proportion of the population aged 18+ who are fully vaccinated by county. 
+
+To calculate the proportion of the population aged 18+ who are fully vaccinated by county, I took the number of people aged 18+ who have received two doses, and divided it by the total population 18+. The summary of this new variable is as follows:
+
+```{r}
+# calculate proportion
+
+#vax <- vax %>% mutate(prop_18plus = series_complete_18plus_pop_pct / 100)
+
+vax <- vax %>% mutate(prop_18plus = series_complete_18plus/total_pop_18plus)
+summary(vax$prop_18plus)
+big <- vax %>% filter(prop_18plus > 1)
+
+# filter out weird obs with number of people vaxxed is higher than the population
+vax <- vax %>% filter(prop_18plus < 1)
+```
+
+Here we can see that there is something strange going on with the maximum, as proportions should be bounded by 0 and 1. Upon further inspection, there were 8 observations where there was a higher number of people vaccinated than there was total population. 
+
+For example, Chattahoochee County, GA had a value of 39042 for the variable `series_complete_18plus`, but only had a total population of 8315 from the ACS data. For the purpose of this analysis, these 8 observations were filtered out.  
+
+Next, we did a quick check of a correlation matrix to see how correlated the potential explanatory variables are. This is done as we would like to avoid adding correlated variables into our model which can produce multicollinearity. The code for this correlation matrix is available in the .Rmd file. 
+
+As expected, we see some high correlations (0.6+) with some variables such as proportion of bachelor above and median income, and proportion with less than high school and low income-poverty ratio.
+
+```{r eval=FALSE}
+# view correlation matrix
+check <- vax %>% dplyr::select(prop_white:prop_low_ratio_ip)
+kable(cor(check, method = "pearson", use = "complete.obs"))
+```
+
+\newpage
+
+## Model Building 
+
+### Model 1 - Binomial 
+
+For our first model, we can try and look at a larger range of covariates. Here, we will first try proportion foreign born, median age, proportion bachelor above, proportion not in labour force, proportion with health insurance, SVI, metro status, and proportion low IP ratio. This is just so we can first get a sense of the data. 
+
+Please note that the output has been suppressed for the PDF, please see .Rmd file for model summary.
+
+```{r include=FALSE}
+q4_all <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~  prop_foreign_born + median_age + prop_bachelor_above + prop_nilf 
+              + prop_health_insurance + svi_ctgy + metro_status + prop_low_ratio_ip, family = "binomial", data = vax)
+summary(q4_all)
+```
+
+Looking at the model fitted with all of the mentioned covariates, we can see that all of the variables are significant at the 0.05 level. This is a bit suspicious so we can potentially remove some variables to see how this affects the model. 
+
+
+### Model 2 - Binomial 
+Based on our EDA, we can keep only the ones we suspect to be important, namely, proportion foreign born, proportion with bachelor or above, proportion not in labour force, proportion with health insurance, metro status, and SVI index. The resulting binomial model is available in the .Rmd file.
+
+```{r include=FALSE}
+q4_bin <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~ prop_foreign_born + prop_bachelor_above
+                + prop_nilf + prop_health_insurance  + metro_status + svi_ctgy, family="binomial", data=vax)
+
+summary(q4_bin)
+```
+
+Again, we are seeing very small p-values, and all predictors are statistically significant. This can be indicative of over-dispersion. We can also see that the residual deviance is very high compared to the degrees of freedom. One way to try and combat this is to use a **quasi-binomial** model instead.
+
+### Model 3 - Quasi-Binomial 
+We then fit a quasi-binomial model using the same covariates from the previous binomial model. The summary is available in the .Rmd file.
+
+```{r include=FALSE}
+q4_quasi1 <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~ prop_foreign_born + prop_bachelor_above
+                + prop_nilf + prop_health_insurance  + metro_status + svi_ctgy, family="quasibinomial", data=vax)
+
+summary(q4_quasi1)
+```
+
+In this model we can see that proportion not in labour force and one level of SVI are not as significant as the other variables, as they are only significant at the 0.1 level. It is important to note that when we are working with categorical variables such as SVI, that we must treat the variable as a whole, and should not remove one level from the model and not the others. 
+
+We can use the `drop1()` and `anova()` functions with the likelihood ratio test (LRT) to see which variables we can potentially remove from our model. 
+
+Using the `drop1()` function:
+```{r}
+drop1(q4_quasi1,test="LRT")
+```
+
+\newpage
+
+Using the `anova()` function:
+```{r}
+(anova(q4_quasi1, test="LRT"))
+```
+
+Looking at the output of both the drop1 and ANOVA functions, we can see that we can remove the variable `prop_nilf`. 
+
+\newpage
+
+### Model 4 - Quasi-Binomial 
+The resulting model with `prop_nilf` removed is as follows:
+
+```{r}
+q4_quasi2 <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~ prop_foreign_born + prop_bachelor_above
+                 + prop_health_insurance  + metro_status + svi_ctgy, family="quasibinomial", data=vax)
+
+summary(q4_quasi2)
+```
+Here we can see everything is significant except for category D of SVI.
+
+```{r include=FALSE}
+drop1(q4_quasi2, test="LRT")
+(anova(q4_quasi2, test="LRT"))
+```
+
+After checking the `drop1()` and `anova()` functions, we now see that all the variables left in the model are significant using the LRT tests. Now that we have sufficiently chosen our main effects, let us try some interactions.
+
+### Model 5 - Quasi-Binomial with Interactions
+Now that we have the main effects chosen, we can consider adding interaction terms into the model. For this analysis, I will only consider two-way interaction terms. The summary is available in the .Rmd file. 
+
+```{r include=FALSE}
+q4_quasi3 <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~ (prop_foreign_born + prop_bachelor_above
+                 + prop_health_insurance  + metro_status +svi_ctgy)^2, family="quasibinomial", data=vax)
+summary(q4_quasi3)
+```
+
+```{r include=FALSE}
+drop1(q4_quasi3, test="LRT")
+```
+
+After examining all of the second-order interaction terms using the `drop1()` function, we can keep interactions between the proportion foreign born and proportion health insurance, metro status and SVI, as well as interactions between SVI and proportion of bachelor above and health_insurance.
+
+\newpage
+
+### Model 6 - Final Model
+Therefore, the final model including interactions is as follows:
+
+```{r}
+q4_quasi4 <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~ prop_foreign_born + prop_bachelor_above
+                 + prop_health_insurance  + metro_status +svi_ctgy + prop_foreign_born:prop_health_insurance + prop_foreign_born:metro_status + prop_foreign_born:svi_ctgy + prop_bachelor_above:svi_ctgy + prop_health_insurance:svi_ctgy , family="quasibinomial", data=vax)
+summary(q4_quasi4)
+```
+
+The way to interpret the coefficients of a quasi-binomial model is similar to the way you would for a normal logistic regression. We must exponentiate the coefficients to produce an odds ratio for success (odds of being fully vaccinated).
+
+Take for example, metro status. Taking, the exponential of the coefficient, we get:
+
+```{r echo=TRUE}
+exp(-0.04890)
+1-exp( -0.04890)
+```
+
+Which means that the odds of being fully vaccinated in non-metro areas is 0.95 times that of the odds in metro areas, i.e., approximately 5% less in non-metro areas than metro areas.   
+
+Finally, we can check that all variables are significant using the LRT test one last time. 
+
+```{r}
+drop1(q4_quasi4,test="LRT")
+```
+
+Here we can see that all variables are significant and we can now move on to model checking.
+
+\newpage
+
+## Model Checking
+
+First, a half-norm plot can help us look for outliers and influential points. 
+
+```{r}
+halfnorm(residuals(q4_quasi2))
+```
+
+Here we see that obs 678 is quite influential, we can consider a fit without this case.
+
+After removing that influential point, the model is refit as previously specified. 
+
+```{r}
+vax2 <- vax[-c(678),]
+q4_quasi5 <- glm(cbind(series_complete_18plus,total_pop_18plus-series_complete_18plus) ~ prop_foreign_born + prop_bachelor_above
+                 + prop_health_insurance  + metro_status +svi_ctgy + prop_foreign_born:prop_health_insurance + prop_foreign_born:metro_status + prop_foreign_born:svi_ctgy + prop_bachelor_above:svi_ctgy + prop_health_insurance:svi_ctgy , family="quasibinomial", data=vax)
+#summary(q4_quasi5)
+```
+
+\newpage
+
+### Residual Plots
+
+Next, we can take a look at some residual plots. 
+
+```{r}
+par(mfrow=c(1,2))
+plot(predict(q4_quasi3),residuals(q4_quasi3,type="pearson"), xlab="Linear Predictor", ylab="Pearson Residuals")
+plot(residuals(q4_quasi3) ~ predict(q4_quasi3,type="link"),
+  xlab="Linear Predictor",
+  ylab="Deviance residuals") 
+```
+
+On the left, we can see the linear predictor plotted against the Pearson residuals, and on the right the linear predictor plotted against the deviance residuals. Both plots are similar and we can see that the residuals tend to scatter around 0 with a number of outliers. 
+
+\newpage
+
+Furthermore, we can look at the binned residual plot: 
+
+```{r}
+binnedplot(fitted(q4_quasi3),
+           residuals(q4_quasi3, type = "response"),
+           nclass = NULL,
+           xlab = "Expected Values",
+           ylab = "Average residual",
+           main = "Binned residual plot",
+           cex.pts = 0.8,
+           col.pts = 1,
+           col.int = "gray")
+```
+
+The grey lines represent +- 2 SE bands, which we would expect to contain about 95% of the observations. We say that a model is reasonable if the majority of the fitted values seem to fall within the SE bands. 
+
+The model does not look reasonable, as there are more outliers among the residuals than we would expect from chance alone (alpha = .05). It looks like the model does not do well when the fitted value is between 0.5 and 0.6. This is indicative of bad model fit.
+
+
+\newpage
+
+## Summary
+
+For this analysis, I tried to consider modeling the outcome measure as a proportion of the population aged 18+ who are fully vaccinated by county using a binomial model, where $n$ was equal to the total population count in the county and $y$ was the number of people 18+ who are fully vaccinated. Assuming that there is independence in the population, we try and get the probability, which is then an unbiased estimate of the proportion of 18+ vaccinated.
+
+First, I tried fitting a binomial model. I then found there to be over-dispersion in the data. To remedy this, I then tried a quasi-binomial model. Using the LRT test in the `drop1()` and `anova()` functions, I then reduced my model down to main effects. After that, I tested two way interaction terms which I could include into the model. 
+
+The final model included the following variables: proportion foreign born, proportion bachelor above, proportion health insurance, metro status, SVI and interactions between the proportion foreign born and proportion health insurance, metro status and SVI, as well as interactions between SVI and proportion of bachelor above and health_insurance.
+
+After looking at the diagnostic and residual plots, it does not appear that my model was very good. In future work, some other variables that may be of interest to investigate are different indicators of health status such as information about whether an individual is immuno-compromised or not, and social demographic information such as household composition, martial status, and ethnic/diversity index.  
+
